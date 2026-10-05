@@ -141,7 +141,7 @@ def test_h1_not_supported_when_margin_unreachable(run, monkeypatch):
     monkeypatch.setitem(stats.H1, "margin", 0.5)
     df, _ = generate_fake_metrics()
     pl = stats.patient_level(df)
-    assert stats.eval_h1(pl)["verdict"] == "NOT SUPPORTED"
+    assert stats.eval_h1(pl, stats.seed_noise_floor(df))["verdict"] == "NOT SUPPORTED"
 
 
 def test_hd95_median_not_mean(run):
@@ -154,3 +154,56 @@ def test_hd95_median_not_mean(run):
     pl = stats.patient_level(df)
     sub = pl[(pl["model"] == "M4") & (pl["condition_id"] == CLEAN)]
     assert sub["hd95_et"].mean() > 3 * r["hd95_et_median"]
+
+
+def test_h1_reports_mean_and_median_and_noise_flag_fields(run):
+    _, _, res, _ = run
+    h1 = res["hypotheses"].set_index("hypothesis").loc["H1"]
+    for col in ["estimate", "median", "median_ci95_low", "median_ci95_high"]:
+        assert not np.isnan(h1[col])
+    assert not h1["within_training_noise"]  # planted ~0.10 effect vs 0.01 floor
+    assert "within_training_noise" in res["hypotheses"].columns
+
+
+def test_h3_aligns_by_patient_id_not_position(run):
+    df, _, _, _ = run
+    pl = stats.patient_level(df)
+    floor = stats.seed_noise_floor(df)
+    before = stats.eval_h3(pl, floor)
+    shuffled = pl.sample(frac=1.0, random_state=0).reset_index(drop=True)
+    after = stats.eval_h3(shuffled, floor)
+    assert after["estimate"] == pytest.approx(before["estimate"])
+    # drop one patient from M5 only: positional truncation would misalign the rest
+    drop_pid = pl["patient_id"].iloc[0]
+    partial = pl[~((pl["model"] == "M5") & (pl["patient_id"] == drop_pid))]
+    res = stats.eval_h3(partial, floor)
+    assert abs(res["estimate"] - before["estimate"]) < 0.1
+
+
+def test_realistic_regime_h1_not_supported_and_flagged(monkeypatch, tmp_path):
+    """Joshua's finding C2/C7: M0 drops only 0.006 and seed SD is 0.015, so nothing beats the noise."""
+    from python.analysis import make_fake_metrics as fm
+    monkeypatch.setattr(fm, "M0_DROP_WORST", 0.006)
+    monkeypatch.setattr(fm, "AUG_DROP_WORST", 0.006)
+    monkeypatch.setattr(fm, "SEED_NOISE_SD", 0.015)
+    monkeypatch.setattr(fm, "M4_GAIN_OVER_M1", {"clean": 0.005, "worst": 0.005})
+    df, truth = fm.generate_fake_metrics()
+    assert truth["m0_drop"] == pytest.approx(0.006 * truth["scale_empty_et"])
+    csv = tmp_path / "realistic.csv"
+    df.to_csv(csv, index=False)
+    res = stats.run_statistical_tests(str(csv), str(tmp_path / "tables"))
+
+    floor = res["seed_noise_floor"]
+    f = floor[(floor["metric"] == "dice_mean") & (floor["condition"] == WORST) & (floor["model"] == "M0")]
+    assert f["seed_sd"].iloc[0] == pytest.approx(0.015, abs=0.002)
+
+    h = res["hypotheses"].set_index("hypothesis")
+    assert h.loc["H1", "verdict"] == "NOT SUPPORTED"
+    assert h.loc["H1", "within_training_noise"]
+    assert abs(h.loc["H1", "estimate"]) < 2 * 0.015
+    assert h.loc["H2", "within_training_noise"]
+
+    t = res["statistical_tests"]
+    r = row(t, "M4", "M0", WORST)
+    assert r["within_training_noise"]
+    assert row(t, "M1", "M0", WORST)["within_training_noise"]
