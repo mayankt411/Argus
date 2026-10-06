@@ -14,3 +14,4 @@ __pycache__/
 # Keep result logs and checkpoints (tracked)
 !results/**/*.csv
 !results/**/*.pt
+figures/interactive/*.html
